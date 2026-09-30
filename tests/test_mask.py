@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 from numcodecs.abc import Codec
 
+from numcodecs_mask.abc import MaskAwareCodecMixin
+
 
 def test_from_config():
     config = dict(
@@ -113,3 +115,87 @@ class NoiseCodec(Codec):
 
 
 numcodecs.registry.register_codec(NoiseCodec)
+
+
+class SparseCodec(Codec, MaskAwareCodecMixin):
+    """Test codec that only stores the unmasked values and records the masks
+    it was given."""
+
+    __slots__: tuple[str, ...] = ("masks",)
+
+    codec_id: ClassVar[str] = "sparse-test"  # type: ignore
+
+    def __init__(self):
+        self.masks: list[np.ndarray] = []
+
+    def encode(self, buf):
+        return self.encode_masked(buf, np.zeros(np.shape(buf), dtype=np.bool))
+
+    def decode(self, buf, out=None):
+        return self.decode_masked(buf, np.zeros(np.shape(out), dtype=np.bool), out)
+
+    def encode_masked(self, buf, mask):
+        a = numcodecs.compat.ensure_ndarray(buf)
+        assert mask.shape == a.shape and mask.dtype == np.bool
+        self.masks.append(np.copy(mask))
+        return a[~mask].tobytes()
+
+    def decode_masked(self, buf, mask, out=None):
+        assert out is not None and mask.shape == out.shape
+        decoded = np.zeros(out.shape, dtype=out.dtype)
+        decoded[~mask] = np.frombuffer(
+            numcodecs.compat.ensure_bytes(buf), dtype=out.dtype
+        )
+        return numcodecs.compat.ndarray_copy(decoded, out)
+
+    def get_config(self) -> dict:
+        return dict(id=type(self).codec_id)
+
+
+def test_mask_aware_codec():
+    from numcodecs_mask import MaskMetaCodec
+
+    data = np.array([[1.0, np.nan, 3.0], [np.nan, 5.0, 0.0]])
+
+    inner = SparseCodec()
+    codec = MaskMetaCodec(mask=np.nan, codec=inner, bitmap_codec=dict(id="packbits"))
+
+    encoded = codec.encode(data)
+    # only the unmasked values were passed on to the inner codec
+    assert len(inner.masks) == 1
+    np.testing.assert_array_equal(inner.masks[0], np.isnan(data))
+
+    decoded = codec.decode(encoded)
+    np.testing.assert_array_equal(decoded, data)
+
+
+def test_nested_mask_aware_codecs():
+    from numcodecs_mask import MaskMetaCodec
+
+    data = np.array([[1.0, np.nan, 3.0], [np.nan, 5.0, 0.0], [0.0, 7.0, np.nan]])
+
+    inner = SparseCodec()
+    codec = MaskMetaCodec(
+        mask=np.nan,
+        codec=MaskMetaCodec(mask=0.0, codec=inner, bitmap_codec=dict(id="packbits")),
+        bitmap_codec=dict(id="packbits"),
+    )
+
+    encoded = codec.encode(data)
+    # the innermost codec receives the union of both masks
+    assert len(inner.masks) == 1
+    np.testing.assert_array_equal(inner.masks[0], np.isnan(data) | (data == 0.0))
+
+    decoded = codec.decode(encoded)
+    np.testing.assert_array_equal(decoded, data)
+
+
+def test_mask_unaware_codec_unchanged():
+    from numcodecs_mask import MaskMetaCodec
+
+    # codecs without mask support are used exactly as before
+    data = np.array([1.0, np.nan, 3.0])
+    codec = MaskMetaCodec(
+        mask=np.nan, codec=dict(id="zlib", level=1), bitmap_codec=dict(id="packbits")
+    )
+    np.testing.assert_array_equal(codec.decode(codec.encode(data)), data)

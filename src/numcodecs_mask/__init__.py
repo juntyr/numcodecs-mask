@@ -2,7 +2,7 @@
 Masking codecs for the [`numcodecs`][numcodecs] buffer compression API.
 """
 
-__all__ = ["MaskMetaCodec"]
+__all__ = ["MaskMetaCodec", "MaskAwareCodecMixin"]
 
 from collections.abc import Callable
 from functools import reduce
@@ -16,8 +16,10 @@ from numcodecs.abc import Codec
 from numcodecs_combinators.abc import CodecCombinatorMixin
 from typing_extensions import Buffer  # MSPV 3.12
 
+from .abc import MaskAwareCodecMixin
 
-class MaskMetaCodec(Codec, CodecCombinatorMixin):
+
+class MaskMetaCodec(Codec, CodecCombinatorMixin, MaskAwareCodecMixin):
     """
     Meta-codec that masks a value during encoding and restores it during decoding.
 
@@ -31,6 +33,13 @@ class MaskMetaCodec(Codec, CodecCombinatorMixin):
     in the `codec`, e.g. by stacking using the
     [`numcodecs-combinators`](https://numcodecs-combinators.readthedocs.io)
     package.
+
+    If the `codec` implements the
+    [`MaskAwareCodecMixin`][numcodecs_mask.abc.MaskAwareCodecMixin], it is
+    given the mask so that it can skip the masked values instead of encoding
+    a fill value for them. The [`MaskMetaCodec`][.] implements the mixin
+    itself, such that nested mask meta-codecs forward the union of their masks
+    to the innermost codec.
 
     Parameters
     ----------
@@ -86,13 +95,41 @@ class MaskMetaCodec(Codec, CodecCombinatorMixin):
             protocol.
         """
 
+        return self._encode(buf, None)
+
+    def encode_masked(
+        self, buf: Buffer, mask: np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+    ) -> Buffer:
+        """Encode the data in `buf`, ignoring the values where `mask` is
+        [`True`][True] (they are neither encoded nor restored by this codec).
+
+        Parameters
+        ----------
+        buf : Buffer
+            Data to be encoded. May be any object supporting the new-style
+            buffer protocol. The values at masked positions are unspecified.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the data, of
+            the values that do not need to be preserved.
+
+        Returns
+        -------
+        enc : Buffer
+            Encoded data. May be any object supporting the new-style buffer
+            protocol.
+        """
+
+        return self._encode(buf, mask)
+
+    def _encode(
+        self,
+        buf: Buffer,
+        outer_mask: None | np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+    ) -> bytes:
         a = np.copy(numcodecs.compat.ensure_ndarray(buf))
         dtype, shape = a.dtype, a.shape
 
-        if isinstance(self._mask, int) or not np.isnan(self._mask):
-            is_masked = a == self._mask
-        else:
-            is_masked = np.isnan(a)
+        is_masked = self._is_masked(a)
 
         # message: dtype shape encoded-dtype encoded-shape [padding] encoded
         #          bitmap-dtype bitmap-shape [padding] bitmap
@@ -105,8 +142,13 @@ class MaskMetaCodec(Codec, CodecCombinatorMixin):
         for s in shape:
             message.append(leb128.u.encode(s))
 
-        encoded = self._codec.encode(a)
-        encoded = numcodecs.compat.ensure_ndarray(encoded)
+        encoded_buf: Buffer
+        if isinstance(self._codec, MaskAwareCodecMixin):
+            inner_mask = is_masked if outer_mask is None else (is_masked | outer_mask)
+            encoded_buf = self._codec.encode_masked(a, inner_mask)  # type: ignore
+        else:
+            encoded_buf = self._codec.encode(a)
+        encoded = numcodecs.compat.ensure_ndarray(encoded_buf)
 
         message.append(leb128.u.encode(len(encoded.dtype.str)))
         message.append(encoded.dtype.str.encode("ascii"))
@@ -168,6 +210,45 @@ class MaskMetaCodec(Codec, CodecCombinatorMixin):
             protocol.
         """
 
+        return self._decode(buf, None, out)
+
+    def decode_masked(
+        self,
+        buf: Buffer,
+        mask: np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+        out: None | Buffer = None,
+    ) -> Buffer:
+        """
+        Decode the data in `buf`, which was encoded with the same `mask`.
+
+        Parameters
+        ----------
+        buf : Buffer
+            Encoded data. May be any object supporting the new-style buffer
+            protocol.
+        mask : np.ndarray[tuple[int, ...], np.dtype[np.bool]]
+            The [boolean][numpy.bool] mask, of the same shape as the decoded
+            data, that was passed to
+            [`encode_masked`][numcodecs_mask.MaskMetaCodec.encode_masked].
+        out : Buffer, optional
+            Writeable buffer to store decoded data. N.B. if provided, this buffer must
+            be exactly the right size to store the decoded data.
+
+        Returns
+        -------
+        dec : Buffer
+            Decoded data. May be any object supporting the new-style buffer
+            protocol. The values at masked positions are unspecified.
+        """
+
+        return self._decode(buf, mask, out)
+
+    def _decode(
+        self,
+        buf: Buffer,
+        outer_mask: None | np.ndarray[tuple[int, ...], np.dtype[np.bool]],
+        out: None | Buffer,
+    ) -> Buffer:
         b = numcodecs.compat.ensure_bytes(buf)
         b_io = BytesIO(b)
 
@@ -201,9 +282,6 @@ class MaskMetaCodec(Codec, CodecCombinatorMixin):
             .reshape(encoded_shape)
         )
 
-        decoded = np.empty(shape, dtype=dtype)
-        self._codec.decode(encoded, out=decoded)
-
         bitmap_dtype = np.dtype(
             b_io.read(leb128.u.decode_reader(b_io)[0]).decode("ascii")
         )
@@ -229,9 +307,23 @@ class MaskMetaCodec(Codec, CodecCombinatorMixin):
         is_masked = np.empty(shape, dtype=np.bool)
         self._bitmap_codec.decode(bitmap, out=is_masked)
 
+        decoded = np.empty(shape, dtype=dtype)
+        if isinstance(self._codec, MaskAwareCodecMixin):
+            inner_mask = is_masked if outer_mask is None else (is_masked | outer_mask)
+            self._codec.decode_masked(encoded, inner_mask, out=decoded)  # type: ignore
+        else:
+            self._codec.decode(encoded, out=decoded)
+
         decoded[is_masked] = self._mask
 
         return numcodecs.compat.ndarray_copy(decoded, out)  # type: ignore
+
+    def _is_masked(
+        self, a: np.ndarray
+    ) -> np.ndarray[tuple[int, ...], np.dtype[np.bool]]:
+        if isinstance(self._mask, int) or not np.isnan(self._mask):
+            return a == self._mask  # type: ignore
+        return np.isnan(a)  # type: ignore
 
     def get_config(self) -> dict:
         """
