@@ -31,9 +31,28 @@ class MaskAwareCodecMixin(ABC):
     [`decode_masked`][numcodecs_mask.abc.MaskAwareCodecMixin.decode_masked].
     Meta-codecs that implement this mixin should forward the mask, combined
     with any values they mask themselves, to their inner codecs.
+
+    The mixin is a structural ABC: any class that defines both
+    [`encode_masked`][numcodecs_mask.abc.MaskAwareCodecMixin.encode_masked]
+    and
+    [`decode_masked`][numcodecs_mask.abc.MaskAwareCodecMixin.decode_masked]
+    passes [`isinstance`][isinstance] and [`issubclass`][issubclass] checks
+    against it, even without inheriting from it. This allows packages that
+    [`numcodecs-mask`][numcodecs_mask] itself depends on, such as
+    `numcodecs-combinators`, to implement the protocol without creating a
+    circular dependency.
     """
 
     __slots__ = ()
+
+    @classmethod
+    def __subclasshook__(cls, subclass: type) -> bool:
+        if cls is MaskAwareCodecMixin:
+            return all(
+                any(callable(vars(base).get(method)) for base in subclass.__mro__)
+                for method in ("encode_masked", "decode_masked")
+            )
+        return NotImplemented  # type: ignore
 
     @abstractmethod
     def encode_masked(

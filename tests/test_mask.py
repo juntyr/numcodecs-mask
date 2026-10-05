@@ -199,3 +199,49 @@ def test_mask_unaware_codec_unchanged():
         mask=np.nan, codec=dict(id="zlib", level=1), bitmap_codec=dict(id="packbits")
     )
     np.testing.assert_array_equal(codec.decode(codec.encode(data)), data)
+
+
+def test_structural_subclass():
+    from numcodecs_mask import MaskMetaCodec
+    from numcodecs_mask.abc import MaskAwareCodecMixin
+
+    class StructuralSparseCodec(Codec):
+        """Implements the protocol without inheriting from the mixin."""
+
+        codec_id: ClassVar[str] = "structural-sparse-test"  # type: ignore
+
+        def encode(self, buf):
+            return self.encode_masked(buf, np.zeros(np.shape(buf), dtype=np.bool))
+
+        def decode(self, buf, out=None):
+            return self.decode_masked(buf, np.zeros(np.shape(out), dtype=np.bool), out)
+
+        def encode_masked(self, buf, mask):
+            a = numcodecs.compat.ensure_ndarray(buf)
+            return a[~mask].tobytes()
+
+        def decode_masked(self, buf, mask, out=None):
+            assert out is not None and mask.shape == out.shape
+            decoded = np.zeros(out.shape, dtype=out.dtype)
+            decoded[~mask] = np.frombuffer(
+                numcodecs.compat.ensure_bytes(buf), dtype=out.dtype
+            )
+            return numcodecs.compat.ndarray_copy(decoded, out)
+
+        def get_config(self) -> dict:
+            return dict(id=type(self).codec_id)
+
+    assert issubclass(StructuralSparseCodec, MaskAwareCodecMixin)
+    assert isinstance(StructuralSparseCodec(), MaskAwareCodecMixin)
+    assert not issubclass(NoiseCodec, MaskAwareCodecMixin)
+
+    data = np.array([[1.0, np.nan, 3.0], [np.nan, 5.0, 0.0]])
+    codec = MaskMetaCodec(
+        mask=np.nan,
+        codec=StructuralSparseCodec(),
+        bitmap_codec=dict(id="packbits"),
+    )
+    encoded = codec.encode(data)
+    # 4 unmasked float64 values -> the sparse codec stored exactly those
+    decoded = codec.decode(encoded)
+    np.testing.assert_array_equal(decoded, data)
