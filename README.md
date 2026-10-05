@@ -8,6 +8,8 @@
 
 Masking codecs for the [`numcodecs`] buffer compression API.
 
+The `MaskMetaCodec` masks a value (e.g. NaN) during encoding and restores it during decoding. Inner codecs that implement the `MaskAwareCodecMixin` are given the mask and can skip the masked values entirely (e.g. entropy coders can avoid spending bits on them and treat them as missing in their context modelling); nested `MaskMetaCodec`s forward the union of their masks.
+
 [`numcodecs`]: https://numcodecs.readthedocs.io/en/stable/
 
 ## License
